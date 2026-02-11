@@ -1,18 +1,7 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect } from "react";
+import { db } from "./firebase";
+import { collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy } from "firebase/firestore";
 import "./App.css";
-
-const storage = {
-  get: (key) => {
-    const val = localStorage.getItem(key);
-    return val ? { value: val } : null;
-  },
-  set: (key, value) => {
-    localStorage.setItem(key, value);
-  },
-};
-
-const ADMIN_KEY = "fm_admin_data";
-const TRANSACTIONS_KEY = "fm_transactions";
 
 function AnimatedCounter({ value, suffix = "" }) {
   const [display, setDisplay] = useState(value);
@@ -66,44 +55,58 @@ function LoginScreen({ onLogin }) {
   const [password, setPassword] = useState("");
   const [isRegistering, setIsRegistering] = useState(false);
   const [error, setError] = useState("");
+  const [admins, setAdmins] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  const handleSubmit = () => {
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "admins"), (snap) => {
+      if (snap.empty) {
+        setAdmins(null);
+      } else {
+        const data = snap.docs[0].data();
+        data.docId = snap.docs[0].id;
+        setAdmins(data);
+      }
+      setLoading(false);
+    });
+    return () => unsub();
+  }, []);
+
+  const handleSubmit = async () => {
     setError("");
     if (!username.trim() || !password.trim()) {
       setError("يرجى ملء جميع الحقول");
       return;
     }
-    const res = storage.get(ADMIN_KEY);
-    const adminData = res ? JSON.parse(res.value) : null;
 
     if (isRegistering) {
-      if (adminData) {
+      if (admins) {
         setError("يوجد مسؤول بالفعل، يرجى تسجيل الدخول");
         return;
       }
-      const newAdmin = { username: username.trim(), password: password.trim(), role: "owner", createdAt: new Date().toISOString() };
-      storage.set(ADMIN_KEY, JSON.stringify({ owner: newAdmin, managers: [] }));
-      storage.set(TRANSACTIONS_KEY, JSON.stringify([]));
-      onLogin({ ...newAdmin });
+      const newAdmin = { username: username.trim(), password: password.trim(), role: "owner", createdAt: new Date().toISOString(), managers: [] };
+      await addDoc(collection(db, "admins"), newAdmin);
+      onLogin({ username: newAdmin.username, role: "owner" });
     } else {
-      if (!adminData) {
+      if (!admins) {
         setError("لا يوجد حساب، يرجى إنشاء حساب أولاً");
         setIsRegistering(true);
         return;
       }
-      const data = adminData;
-      if (data.owner.username === username.trim() && data.owner.password === password.trim()) {
-        onLogin({ ...data.owner });
+      if (admins.username === username.trim() && admins.password === password.trim()) {
+        onLogin({ username: admins.username, role: "owner" });
       } else {
-        const mgr = (data.managers || []).find((m) => m.username === username.trim() && m.password === password.trim());
+        const mgr = (admins.managers || []).find((m) => m.username === username.trim() && m.password === password.trim());
         if (mgr) {
-          onLogin({ ...mgr, role: "manager" });
+          onLogin({ username: mgr.username, role: "manager" });
         } else {
           setError("اسم المستخدم أو كلمة المرور غير صحيحة");
         }
       }
     }
   };
+
+  if (loading) return <div className="login-page"><p style={{color:"#64748B"}}>جاري التحميل...</p></div>;
 
   return (
     <div className="login-page">
@@ -138,6 +141,7 @@ function LoginScreen({ onLogin }) {
 
 function Dashboard({ user, onLogout }) {
   const [transactions, setTransactions] = useState([]);
+  const [admins, setAdmins] = useState(null);
   const [managers, setManagers] = useState([]);
   const [showAddIncome, setShowAddIncome] = useState(false);
   const [showAddExpense, setShowAddExpense] = useState(false);
@@ -150,14 +154,26 @@ function Dashboard({ user, onLogout }) {
   const [mgrPassword, setMgrPassword] = useState("");
   const [filterType, setFilterType] = useState("all");
 
-  const loadData = useCallback(() => {
-    const txRes = storage.get(TRANSACTIONS_KEY);
-    if (txRes) setTransactions(JSON.parse(txRes.value));
-    const adminRes = storage.get(ADMIN_KEY);
-    if (adminRes) setManagers(JSON.parse(adminRes.value).managers || []);
+  useEffect(() => {
+    const q = query(collection(db, "transactions"), orderBy("date", "desc"));
+    const unsub = onSnapshot(q, (snap) => {
+      const txs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setTransactions(txs);
+    });
+    return () => unsub();
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    const unsub = onSnapshot(collection(db, "admins"), (snap) => {
+      if (!snap.empty) {
+        const data = snap.docs[0].data();
+        data.docId = snap.docs[0].id;
+        setAdmins(data);
+        setManagers(data.managers || []);
+      }
+    });
+    return () => unsub();
+  }, []);
 
   const totalIncome = transactions.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
   const totalExpense = transactions.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
@@ -165,43 +181,41 @@ function Dashboard({ user, onLogout }) {
 
   const resetForm = () => { setAmount(""); setNote(""); setReceipt(null); };
 
-  const addTransaction = (type) => {
+  const addTransaction = async (type) => {
     const val = parseFloat(amount);
     if (!val || val <= 0) { setToast({ message: "يرجى إدخال مبلغ صحيح", type: "error" }); return; }
-    const tx = { id: Date.now().toString(), type, amount: val, note: note.trim(), receipt: receipt ? receipt.name : null, addedBy: user.username, date: new Date().toISOString() };
-    const updated = [tx, ...transactions];
-    setTransactions(updated);
-    storage.set(TRANSACTIONS_KEY, JSON.stringify(updated));
+    await addDoc(collection(db, "transactions"), {
+      type, amount: val, note: note.trim(), receipt: receipt ? receipt.name : null,
+      addedBy: user.username, date: new Date().toISOString(),
+    });
     resetForm(); setShowAddIncome(false); setShowAddExpense(false);
     setToast({ message: type === "income" ? "تم إضافة المدخول بنجاح" : "تم إضافة المصروف بنجاح", type: "success" });
   };
 
-  const deleteTransaction = (id) => {
-    const updated = transactions.filter((t) => t.id !== id);
-    setTransactions(updated);
-    storage.set(TRANSACTIONS_KEY, JSON.stringify(updated));
+  const deleteTransaction = async (id) => {
+    await deleteDoc(doc(db, "transactions", id));
     setToast({ message: "تم حذف العملية", type: "success" });
   };
 
-  const addManager = () => {
+  const addManager = async () => {
     if (!mgrUsername.trim() || !mgrPassword.trim()) { setToast({ message: "يرجى ملء جميع الحقول", type: "error" }); return; }
-    const adminRes = storage.get(ADMIN_KEY);
-    const data = JSON.parse(adminRes.value);
-    if (data.owner.username === mgrUsername.trim() || data.managers.some((m) => m.username === mgrUsername.trim())) {
+    if (!admins) return;
+    const currentManagers = admins.managers || [];
+    if (admins.username === mgrUsername.trim() || currentManagers.some((m) => m.username === mgrUsername.trim())) {
       setToast({ message: "اسم المستخدم موجود بالفعل", type: "error" }); return;
     }
-    data.managers.push({ username: mgrUsername.trim(), password: mgrPassword.trim(), role: "manager", createdAt: new Date().toISOString() });
-    storage.set(ADMIN_KEY, JSON.stringify(data));
-    setManagers(data.managers); setMgrUsername(""); setMgrPassword(""); setShowAddManager(false);
+    const updatedManagers = [...currentManagers, { username: mgrUsername.trim(), password: mgrPassword.trim(), role: "manager", createdAt: new Date().toISOString() }];
+    const { updateDoc } = await import("firebase/firestore");
+    await updateDoc(doc(db, "admins", admins.docId), { managers: updatedManagers });
+    setMgrUsername(""); setMgrPassword(""); setShowAddManager(false);
     setToast({ message: "تم إضافة المدير بنجاح", type: "success" });
   };
 
-  const removeManager = (username) => {
-    const adminRes = storage.get(ADMIN_KEY);
-    const data = JSON.parse(adminRes.value);
-    data.managers = data.managers.filter((m) => m.username !== username);
-    storage.set(ADMIN_KEY, JSON.stringify(data));
-    setManagers(data.managers);
+  const removeManager = async (username) => {
+    if (!admins) return;
+    const updatedManagers = (admins.managers || []).filter((m) => m.username !== username);
+    const { updateDoc } = await import("firebase/firestore");
+    await updateDoc(doc(db, "admins", admins.docId), { managers: updatedManagers });
     setToast({ message: "تم حذف المدير", type: "success" });
   };
 
